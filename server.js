@@ -84,15 +84,73 @@ app.post('/api/projetos', async (req, res) => {
     try {
         const { ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor } = req.body;
 
-        if (!ns || ns.length !== 10) {
-            return res.status(400).json({ success: false, error: 'NS deve ter exatamente 10 caracteres.' });
+        const errors = [];
+
+        if (!ns || !/^\d{10}$/.test(ns)) {
+            errors.push('NS deve ter exatamente 10 dígitos numéricos.');
+        }
+
+        const topografoStr = (topografo || '').toString().trim();
+        if (!topografoStr || topografoStr.length > 50) {
+            errors.push('Topógrafo é obrigatório e deve ter no máximo 50 caracteres.');
+        }
+
+        const categoriasValidas = ['AC', 'EXT.RURAL', 'EXT.URB', 'MOD.URB', 'AFAST/REM', 'RL/BRT', 'PASTO', 'ESTRADA'];
+        if (!Array.isArray(categorias_globais)) {
+            errors.push('Categorias deve ser um array.');
+        } else {
+            const categoriasInvalidas = categorias_globais.filter(c => !categoriasValidas.includes(c));
+            if (categoriasInvalidas.length > 0) {
+                errors.push('Categorias inválidas encontradas: ' + categoriasInvalidas.join(', ') + '. Permitidos: ' + categoriasValidas.join(', '));
+            }
+        }
+
+        if (!Array.isArray(postes)) {
+            errors.push('Postes deve ser um array.');
+        } else if (postes.length > 500) {
+            errors.push('Máximo de 500 postes permitidos por projeto.');
+        } else {
+            const tiposPosteValidos = ['projetado', 'existente', 'rural'];
+            for (let i = 0; i < postes.length; i++) {
+                const p = postes[i];
+                if (!p || typeof p.x !== 'number' || typeof p.y !== 'number' || isNaN(p.x) || isNaN(p.y)) {
+                    errors.push(`Poste na posição ${i} possui coordenadas (x, y) inválidas.`);
+                    break;
+                }
+                if (!tiposPosteValidos.includes(p.tipo)) {
+                    errors.push(`Poste na posição ${i} possui tipo inválido. Permitidos: projetado, existente, rural.`);
+                    break;
+                }
+            }
+        }
+
+        if (ambiental !== 'SIM' && ambiental !== 'NÃO') {
+            errors.push('Ambiental deve ser SIM ou NÃO.');
+        }
+
+        if (servidao && !['SST', 'SSC', 'SSTC'].includes(servidao)) {
+            errors.push('Servidão deve ser SST, SSC, SSTC ou vazio.');
+        }
+
+        const kmParsed = parseFloat(km_valor) || 0;
+        if (kmParsed < 0) {
+            errors.push('KM valor não pode ser negativo.');
+        }
+
+        const totalParsed = parseFloat(total) || 0;
+        if (totalParsed < 0) {
+            errors.push('Total não pode ser negativo.');
+        }
+
+        if (errors.length > 0) {
+            return res.status(400).json({ success: false, errors });
         }
 
         const result = await pool.query(
             `INSERT INTO projetos (ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-            [ns, data_registro, JSON.stringify(postes), total, JSON.stringify(categorias_globais),
-             topografo || '', ambiental || 'NÃO', servidao || '', km_valor || 0]
+            [ns, data_registro, JSON.stringify(postes), totalParsed, JSON.stringify(categorias_globais),
+             topografoStr, ambiental, servidao || '', kmParsed]
         );
 
         res.status(201).json({ success: true, projeto: result.rows[0] });
