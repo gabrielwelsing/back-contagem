@@ -6,7 +6,20 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.use(cors());
+const allowedOrigins = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    /\.railway\.app$/
+];
+app.use(cors({
+    origin: function(origin, callback) {
+        if (!origin) return callback(null, true);
+        const isAllowed = allowedOrigins.some(o => o instanceof RegExp ? o.test(origin) : o === origin);
+        if (isAllowed) callback(null, true);
+        else callback(new Error('Bloqueado pela política de CORS'));
+    },
+    credentials: true
+}));
 app.use(express.json({ limit: '10mb' }));
 
 const pool = new Pool({
