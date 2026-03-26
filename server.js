@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -22,8 +23,15 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
+// Pool do banco PRÓPRIO do app — projetos/postes
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+// Pool do banco do HUB — usado APENAS para validar token_version
+const hubPool = new Pool({
+    connectionString: process.env.HUB_DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
@@ -45,7 +53,6 @@ async function initDB() {
                 criado_em TIMESTAMP DEFAULT NOW()
             );
         `);
-        // Migração: adicionar colunas se não existirem (para bancos já criados)
         const cols = ['topografo VARCHAR(50) DEFAULT \'\'', 'ambiental VARCHAR(10) DEFAULT \'NÃO\'', 'servidao VARCHAR(10) DEFAULT \'\'', 'km_valor NUMERIC(10,2) DEFAULT 0'];
         const names = ['topografo', 'ambiental', 'servidao', 'km_valor'];
         for (let i = 0; i < names.length; i++) {
@@ -58,11 +65,42 @@ async function initDB() {
 }
 initDB();
 
-// --- ROTAS ---
-
+// --- HEALTH ---
 app.get('/', (req, res) => {
     res.json({ success: true, message: 'API Contagem Croqui rodando!' });
 });
+
+// --- VALIDAÇÃO DE TOKEN DO HUB ---
+// Checa assinatura JWT + token_version no banco do hub
+// Se o usuário deslogou do hub, token_version foi incrementado
+// e esse endpoint rejeita na hora — acesso bloqueado instantaneamente
+app.get('/api/auth/validate', async (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth) return res.status(401).json({ error: 'Token ausente' });
+
+    const token = auth.split(' ')[1];
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        const result = await hubPool.query(
+            `SELECT token_version FROM users WHERE id = $1`,
+            [decoded.user_id]
+        );
+
+        const user = result.rows[0];
+        if (!user) return res.status(401).json({ error: 'Usuário não encontrado' });
+
+        if (user.token_version !== decoded.token_version) {
+            return res.status(401).json({ error: 'Sessão encerrada' });
+        }
+
+        res.json({ ok: true, user: decoded });
+    } catch (err) {
+        res.status(401).json({ error: 'Token inválido ou expirado' });
+    }
+});
+
+// --- ROTAS ---
 
 // Listar projetos (com filtro de data opcional)
 app.get('/api/projetos', async (req, res) => {
