@@ -58,7 +58,25 @@ async function initDB() {
         for (let i = 0; i < names.length; i++) {
             await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS ${names[i]} ${cols[i].split(' ').slice(1).join(' ')}`).catch(() => {});
         }
+
+        // Migração: coluna user_id e empresa nos projetos
+        await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS user_id BIGINT`).catch(() => {});
+        await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS empresa VARCHAR(255)`).catch(() => {});
+
+        // Tabela de configs por empresa
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS empresa_configs (
+                id SERIAL PRIMARY KEY,
+                empresa VARCHAR(255) NOT NULL,
+                tipo VARCHAR(50) NOT NULL,
+                valores JSONB NOT NULL DEFAULT '[]',
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(empresa, tipo)
+            );
+        `);
+
         console.log('✅ Tabela "projetos" verificada/migrada.');
+        console.log('✅ Tabela "empresa_configs" verificada/criada.');
     } catch (err) {
         console.error('❌ Erro ao criar tabela:', err.message);
     }
@@ -71,9 +89,6 @@ app.get('/', (req, res) => {
 });
 
 // --- VALIDAÇÃO DE TOKEN DO HUB ---
-// Checa assinatura JWT + token_version no banco do hub
-// Se o usuário deslogou do hub, token_version foi incrementado
-// e esse endpoint rejeita na hora — acesso bloqueado instantaneamente
 app.get('/api/auth/validate', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).json({ error: 'Token ausente' });
@@ -100,15 +115,32 @@ app.get('/api/auth/validate', async (req, res) => {
     }
 });
 
+// --- MIDDLEWARE: extrai dados do token (sem bloquear) ---
+function extrairToken(req, res, next) {
+    const auth = req.headers.authorization;
+    if (auth) {
+        try {
+            req.userDecoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
+        } catch {}
+    }
+    next();
+}
+
 // --- ROTAS ---
 
-// Listar projetos (com filtro de data opcional)
-app.get('/api/projetos', async (req, res) => {
+// Listar projetos (com filtro de data opcional + filtro por user_id para role 'user')
+app.get('/api/projetos', extrairToken, async (req, res) => {
     try {
         const { de, ate } = req.query;
-        let query = 'SELECT * FROM projetos';
+        const user = req.userDecoded;
         const params = [];
         const conditions = [];
+
+        // user comum só vê os próprios projetos
+        if (user && user.role === 'user') {
+            params.push(user.user_id);
+            conditions.push(`user_id = $${params.length}`);
+        }
 
         if (de) {
             params.push(de);
@@ -119,6 +151,7 @@ app.get('/api/projetos', async (req, res) => {
             conditions.push(`criado_em < TO_TIMESTAMP($${params.length}, 'DD/MM/YYYY') + INTERVAL '1 day'`);
         }
 
+        let query = 'SELECT * FROM projetos';
         if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
         query += ' ORDER BY criado_em DESC';
 
@@ -131,9 +164,10 @@ app.get('/api/projetos', async (req, res) => {
 });
 
 // Criar novo projeto
-app.post('/api/projetos', async (req, res) => {
+app.post('/api/projetos', extrairToken, async (req, res) => {
     try {
         const { ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor } = req.body;
+        const user = req.userDecoded;
 
         const errors = [];
 
@@ -146,14 +180,8 @@ app.post('/api/projetos', async (req, res) => {
             errors.push('Topógrafo é obrigatório e deve ter no máximo 50 caracteres.');
         }
 
-        const categoriasValidas = ['AC', 'EXT.RURAL', 'EXT.URB', 'MOD.URB', 'AFAST/REM', 'RL/BRT', 'PASTO', 'ESTRADA'];
         if (!Array.isArray(categorias_globais)) {
             errors.push('Categorias deve ser um array.');
-        } else {
-            const categoriasInvalidas = categorias_globais.filter(c => !categoriasValidas.includes(c));
-            if (categoriasInvalidas.length > 0) {
-                errors.push('Categorias inválidas encontradas: ' + categoriasInvalidas.join(', ') + '. Permitidos: ' + categoriasValidas.join(', '));
-            }
         }
 
         if (!Array.isArray(postes)) {
@@ -184,24 +212,23 @@ app.post('/api/projetos', async (req, res) => {
         }
 
         const kmParsed = parseFloat(km_valor) || 0;
-        if (kmParsed < 0) {
-            errors.push('KM valor não pode ser negativo.');
-        }
+        if (kmParsed < 0) errors.push('KM valor não pode ser negativo.');
 
         const totalParsed = parseFloat(total) || 0;
-        if (totalParsed < 0) {
-            errors.push('Total não pode ser negativo.');
-        }
+        if (totalParsed < 0) errors.push('Total não pode ser negativo.');
 
         if (errors.length > 0) {
             return res.status(400).json({ success: false, errors });
         }
 
+        const userId = user ? user.user_id : null;
+        const empresa = user ? (user.empresa || null) : null;
+
         const result = await pool.query(
-            `INSERT INTO projetos (ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+            `INSERT INTO projetos (ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor, user_id, empresa)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
             [ns, data_registro, JSON.stringify(postes), totalParsed, JSON.stringify(categorias_globais),
-             topografoStr, ambiental, servidao || '', kmParsed]
+             topografoStr, ambiental, servidao || '', kmParsed, userId, empresa]
         );
 
         res.status(201).json({ success: true, projeto: result.rows[0] });
@@ -220,6 +247,66 @@ app.delete('/api/projetos/:id', async (req, res) => {
     } catch (error) {
         console.error('Erro DELETE /api/projetos:', error.message);
         res.status(500).json({ success: false, error: 'Erro ao apagar projeto.' });
+    }
+});
+
+// --- CONFIGS POR EMPRESA ---
+
+// GET configs de uma empresa e tipo
+app.get('/api/configs/:empresa/:tipo', async (req, res) => {
+    try {
+        const { empresa, tipo } = req.params;
+        const tiposValidos = ['categorias', 'topografos'];
+        if (!tiposValidos.includes(tipo)) return res.status(400).json({ error: 'Tipo inválido.' });
+
+        const result = await pool.query(
+            `SELECT valores FROM empresa_configs WHERE empresa = $1 AND tipo = $2`,
+            [empresa, tipo]
+        );
+        res.json({ success: true, valores: result.rows[0]?.valores || null });
+    } catch (err) {
+        console.error('Erro GET /api/configs:', err.message);
+        res.status(500).json({ error: 'Erro ao buscar configs.' });
+    }
+});
+
+// PUT configs — apenas admin_empresa
+app.put('/api/configs/:empresa/:tipo', extrairToken, async (req, res) => {
+    try {
+        const user = req.userDecoded;
+        if (!user || user.role !== 'admin_empresa') {
+            return res.status(403).json({ error: 'Apenas admin_empresa pode alterar configurações.' });
+        }
+
+        // admin_empresa só altera a própria empresa
+        if (user.empresa !== req.params.empresa) {
+            return res.status(403).json({ error: 'Sem permissão para esta empresa.' });
+        }
+
+        const { empresa, tipo } = req.params;
+        const tiposValidos = ['categorias', 'topografos'];
+        if (!tiposValidos.includes(tipo)) return res.status(400).json({ error: 'Tipo inválido.' });
+
+        const { valores } = req.body;
+        if (!Array.isArray(valores)) return res.status(400).json({ error: 'valores deve ser um array.' });
+
+        // Sanitiza: apenas strings não vazias, máx 50 chars cada
+        const sanitized = valores
+            .map(v => String(v).trim().toUpperCase())
+            .filter(v => v.length > 0 && v.length <= 50);
+
+        if (sanitized.length === 0) return res.status(400).json({ error: 'Lista não pode ficar vazia.' });
+
+        await pool.query(`
+            INSERT INTO empresa_configs (empresa, tipo, valores, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (empresa, tipo) DO UPDATE SET valores = $3, updated_at = NOW()
+        `, [empresa, tipo, JSON.stringify(sanitized)]);
+
+        res.json({ success: true, valores: sanitized });
+    } catch (err) {
+        console.error('Erro PUT /api/configs:', err.message);
+        res.status(500).json({ error: 'Erro ao salvar configs.' });
     }
 });
 
