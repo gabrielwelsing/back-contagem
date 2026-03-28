@@ -23,13 +23,11 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// Pool do banco PRÓPRIO do app — projetos/postes
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// Pool do banco do HUB — usado APENAS para validar token_version
 const hubPool = new Pool({
     connectionString: process.env.HUB_DATABASE_URL,
     ssl: { rejectUnauthorized: false }
@@ -58,12 +56,8 @@ async function initDB() {
         for (let i = 0; i < names.length; i++) {
             await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS ${names[i]} ${cols[i].split(' ').slice(1).join(' ')}`).catch(() => {});
         }
-
-        // Migração: coluna user_id e empresa nos projetos
         await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS user_id BIGINT`).catch(() => {});
         await pool.query(`ALTER TABLE projetos ADD COLUMN IF NOT EXISTS empresa VARCHAR(255)`).catch(() => {});
-
-        // Tabela de configs por empresa
         await pool.query(`
             CREATE TABLE IF NOT EXISTS empresa_configs (
                 id SERIAL PRIMARY KEY,
@@ -74,7 +68,6 @@ async function initDB() {
                 UNIQUE(empresa, tipo)
             );
         `);
-
         console.log('✅ Tabela "projetos" verificada/migrada.');
         console.log('✅ Tabela "empresa_configs" verificada/criada.');
     } catch (err) {
@@ -96,47 +89,44 @@ app.get('/api/auth/validate', async (req, res) => {
     const token = auth.split(' ')[1];
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-        const result = await hubPool.query(
-            `SELECT token_version FROM users WHERE id = $1`,
-            [decoded.user_id]
-        );
-
+        const result = await hubPool.query(`SELECT token_version FROM users WHERE id = $1`, [decoded.user_id]);
         const user = result.rows[0];
         if (!user) return res.status(401).json({ error: 'Usuário não encontrado' });
-
-        if (user.token_version !== decoded.token_version) {
-            return res.status(401).json({ error: 'Sessão encerrada' });
-        }
-
+        if (user.token_version !== decoded.token_version) return res.status(401).json({ error: 'Sessão encerrada' });
         res.json({ ok: true, user: decoded });
     } catch (err) {
         res.status(401).json({ error: 'Token inválido ou expirado' });
     }
 });
 
-// --- MIDDLEWARE: extrai dados do token (sem bloquear) ---
-function extrairToken(req, res, next) {
+// --- MIDDLEWARE: bloqueia sem token válido ---
+async function requireAuth(req, res, next) {
     const auth = req.headers.authorization;
-    if (auth) {
-        try {
-            req.userDecoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
-        } catch {}
+    if (!auth) return res.status(401).json({ error: 'Token ausente' });
+
+    const token = auth.split(' ')[1];
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const result = await hubPool.query(`SELECT token_version FROM users WHERE id = $1`, [decoded.user_id]);
+        const user = result.rows[0];
+        if (!user) return res.status(401).json({ error: 'Usuário não encontrado' });
+        if (user.token_version !== decoded.token_version) return res.status(401).json({ error: 'Sessão encerrada' });
+        req.userDecoded = decoded;
+        next();
+    } catch (err) {
+        res.status(401).json({ error: 'Token inválido ou expirado' });
     }
-    next();
 }
 
 // --- ROTAS ---
 
-// Listar projetos (com filtro de data opcional + filtro por user_id para role 'user')
-app.get('/api/projetos', extrairToken, async (req, res) => {
+app.get('/api/projetos', requireAuth, async (req, res) => {
     try {
         const { de, ate } = req.query;
         const user = req.userDecoded;
         const params = [];
         const conditions = [];
 
-        // user comum só vê os próprios projetos
         if (user && user.role === 'user') {
             params.push(user.user_id);
             conditions.push(`user_id = $${params.length}`);
@@ -163,8 +153,7 @@ app.get('/api/projetos', extrairToken, async (req, res) => {
     }
 });
 
-// Criar novo projeto
-app.post('/api/projetos', extrairToken, async (req, res) => {
+app.post('/api/projetos', requireAuth, async (req, res) => {
     try {
         const { ns, data_registro, postes, total, categorias_globais, topografo, ambiental, servidao, km_valor } = req.body;
         const user = req.userDecoded;
@@ -238,8 +227,7 @@ app.post('/api/projetos', extrairToken, async (req, res) => {
     }
 });
 
-// Apagar projeto
-app.delete('/api/projetos/:id', async (req, res) => {
+app.delete('/api/projetos/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         await pool.query('DELETE FROM projetos WHERE id = $1', [id]);
@@ -252,8 +240,7 @@ app.delete('/api/projetos/:id', async (req, res) => {
 
 // --- CONFIGS POR EMPRESA ---
 
-// GET configs de uma empresa e tipo
-app.get('/api/configs/:empresa/:tipo', async (req, res) => {
+app.get('/api/configs/:empresa/:tipo', requireAuth, async (req, res) => {
     try {
         const { empresa, tipo } = req.params;
         const tiposValidos = ['categorias', 'topografos'];
@@ -270,15 +257,13 @@ app.get('/api/configs/:empresa/:tipo', async (req, res) => {
     }
 });
 
-// PUT configs — apenas admin_empresa
-app.put('/api/configs/:empresa/:tipo', extrairToken, async (req, res) => {
+app.put('/api/configs/:empresa/:tipo', requireAuth, async (req, res) => {
     try {
         const user = req.userDecoded;
         if (!user || user.role !== 'admin_empresa') {
             return res.status(403).json({ error: 'Apenas admin_empresa pode alterar configurações.' });
         }
 
-        // admin_empresa só altera a própria empresa
         if (user.empresa !== req.params.empresa) {
             return res.status(403).json({ error: 'Sem permissão para esta empresa.' });
         }
@@ -290,7 +275,6 @@ app.put('/api/configs/:empresa/:tipo', extrairToken, async (req, res) => {
         const { valores } = req.body;
         if (!Array.isArray(valores)) return res.status(400).json({ error: 'valores deve ser um array.' });
 
-        // Sanitiza: apenas strings não vazias, máx 50 chars cada
         const sanitized = valores
             .map(v => String(v).trim().toUpperCase())
             .filter(v => v.length > 0 && v.length <= 50);
