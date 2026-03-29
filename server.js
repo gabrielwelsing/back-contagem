@@ -99,7 +99,7 @@ app.get('/api/auth/validate', async (req, res) => {
     }
 });
 
-// --- MIDDLEWARE: bloqueia sem token válido ---
+// --- MIDDLEWARE ---
 async function requireAuth(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).json({ error: 'Token ausente' });
@@ -123,14 +123,8 @@ async function requireAuth(req, res, next) {
 app.get('/api/projetos', requireAuth, async (req, res) => {
     try {
         const { de, ate } = req.query;
-        const user = req.userDecoded;
         const params = [];
         const conditions = [];
-
-        if (user && user.role === 'user') {
-            params.push(user.user_id);
-            conditions.push(`user_id = $${params.length}`);
-        }
 
         if (de) {
             params.push(de);
