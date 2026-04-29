@@ -125,8 +125,15 @@ async function requireAuth(req, res, next) {
 app.get('/api/projetos', requireAuth, async (req, res) => {
     try {
         const { de, ate } = req.query;
+        const user = req.userDecoded;
         const params = [];
         const conditions = [];
+
+        // Filtra por empresa, exceto admin
+        if (user.role !== 'admin') {
+            params.push(user.empresa || null);
+            conditions.push(`empresa = $${params.length}`);
+        }
 
         if (de) {
             params.push(de);
